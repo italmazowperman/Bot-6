@@ -14,6 +14,9 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 import sys
+import schedule
+import time
+import threading
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -25,72 +28,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Проверка обязательных переменных
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-if not TELEGRAM_BOT_TOKEN:
-    logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
-    logger.info("Добавьте TELEGRAM_BOT_TOKEN в переменные окружения Railway")
-    logger.info("Получите токен у @BotFather в Telegram")
-    sys.exit(1)
+# Инициализация менеджеров
+from database import DatabaseManager
+from notification_service import NotificationService
+from pdf_generator import generate_order_pdf, generate_summary_pdf
+import io
 
-# Инициализация менеджеров с обработкой ошибок
-try:
-    from database import DatabaseManager
-    from models import OrderStatus
-    from utils import format_date, get_status_emoji, format_order_info
-    
-    db = DatabaseManager()
-    logger.info("✅ База данных подключена успешно")
-    
-except Exception as e:
-    logger.error(f"❌ Ошибка при подключении к базе данных: {e}")
-    logger.info("Создаем временную базу данных для тестирования...")
-    
-    # Создаем простой заглушечный DatabaseManager для тестирования
-    class MockDatabaseManager:
-        def get_all_orders(self):
-            return []
-        def get_order_by_number(self, order_number):
-            return None
-        def get_orders_by_status(self, status):
-            return []
-        def get_orders_by_statuses(self, statuses):
-            return []
-        def get_active_orders(self):
-            return []
-        def search_orders(self, search_text):
-            return []
-        def get_statistics(self, days=30):
-            return {
-                'total_orders': 0,
-                'completed_orders': 0,
-                'active_orders': 0,
-                'total_containers': 0,
-                'total_weight': 0,
-                'total_volume': 0,
-                'period_days': days
-            }
-    
-    db = MockDatabaseManager()
-    
-    # Заглушки для утилит
-    def format_date(date):
-        return date.strftime('%d.%m.%Y') if date else "-"
-    
-    def get_status_emoji(status):
-        return "📋"
-    
-    def format_order_info(order):
-        return f"Заказ: {order.order_number}"
+db = DatabaseManager()
+notification_service = NotificationService()
+
+# Переменные для уведомлений
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+ADMIN_CHAT_IDS = os.getenv('ADMIN_CHAT_IDS', '').split(',')
 
 # Команда /start
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user = update.effective_user
+    chat_id = str(update.effective_chat.id)
+    
+    # Подписываем пользователя на уведомления
+    notification_service.subscribe_user(chat_id)
+    
     welcome_text = f"""
 👋 Привет, {user.first_name}!
 
 Я бот логистической компании Margiana Logistic Services.
+Теперь вы подписаны на уведомления об изменениях заказов.
 
 📋 *Доступные команды:*
 
@@ -99,25 +63,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /today - События сегодня
 /search <текст> - Поиск заказов
 /status <статус> - Заказы по статусу
+/orders_no_photos - Заказы без фото загрузки
 
 *Отчеты:*
 /summary - Сводный отчет
-/contacts - Контакты компании
+/pdf <номер_заказа> - PDF отчет по заказу
+/pdf_summary - Сводный PDF отчет
+
+*Уведомления:*
+/subscribe - Подписаться на уведомления
+/unsubscribe - Отписаться от уведомлений
+/settings - Настройки уведомлений
 
 *Помощь:*
 /help - Показать все команды
-/dbstatus - Проверить статус базы данных
-
-💡 *Примеры:*
-`/search ORD-001`
-`/status In Progress`
+/contacts - Контакты компании
 """
     
     keyboard = [
         [InlineKeyboardButton("📊 Активные заказы", callback_data="active")],
         [InlineKeyboardButton("📅 События сегодня", callback_data="today")],
-        [InlineKeyboardButton("📞 Контакты", callback_data="contacts")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="help")]
+        [InlineKeyboardButton("📷 Без фото", callback_data="nophotos")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
     ]
     
     await update.message.reply_text(
@@ -126,106 +93,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# Команда /dbstatus - проверка статуса БД
-async def dbstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверить статус подключения к базе данных"""
+# Команда /orders_no_photos
+async def orders_no_photos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заказы без фото загрузки"""
     try:
-        # Проверяем подключение
-        orders_count = len(db.get_all_orders())
-        
-        # Получаем информацию о переменных окружения (без паролей)
-        db_url = os.getenv('DATABASE_URL', 'Не установлена')
-        bot_token_exists = bool(os.getenv('TELEGRAM_BOT_TOKEN'))
-        
-        status_text = f"""
-📊 *Статус системы:*
-
-✅ Бот запущен и работает
-✅ Telegram токен: {'Установлен' if bot_token_exists else 'Отсутствует'}
-✅ База данных: {'Подключена' if not isinstance(db, MockDatabaseManager) else 'Временная'}
-📦 Заказов в базе: {orders_count}
-
-*Переменные окружения:*
-• DATABASE_URL: {'Установлена' if os.getenv('DATABASE_URL') else 'Отсутствует'}
-• TELEGRAM_BOT_TOKEN: {'Установлен' if bot_token_exists else 'Отсутствует'}
-
-*Для настройки:*
-1. Получите токен у @BotFather
-2. Создайте базу на Supabase.com
-3. Добавьте переменные в Railway
-"""
-        
-        await update.message.reply_text(
-            status_text,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Ошибка проверки статуса: {str(e)[:100]}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-# Команда /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать помощь"""
-    help_text = """
-📋 *Доступные команды:*
-
-*Основные:*
-/start - Начать работу
-/active - Активные заказы
-/today - События сегодня
-/search [текст] - Поиск заказов
-/status [статус] - Заказы по статусу
-
-*Информация:*
-/contacts - Контакты компании
-/dbstatus - Статус базы данных
-
-*Настройка:*
-1. Получите токен бота у @BotFather
-2. Создайте базу данных на supabase.com
-3. Добавьте переменные в Railway:
-   - TELEGRAM_BOT_TOKEN
-   - DATABASE_URL
-4. Перезапустите приложение
-
-*Поддержка:*
-Для помощи по настройке обратитесь к разработчику.
-"""
-    
-    await update.message.reply_text(
-        help_text,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-# Команда /active
-async def active_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать активные заказы"""
-    try:
-        orders = db.get_active_orders()
+        orders = db.get_orders_without_photos()
         
         if not orders:
             await update.message.reply_text(
-                "📭 Нет активных заказов.\n\n"
-                "Возможно:\n"
-                "1. База данных пуста\n"
-                "2. Нет заказов со статусами 'New', 'In Progress', 'In Transit'\n"
-                "3. Не настроена синхронизация с WPF программой",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔄 Проверить статус", callback_data="dbstatus")
-                ]])
+                "✅ Все заказы имеют фото загрузки!",
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
-        text = f"📊 *Активные заказы* ({len(orders)}):\n\n"
-        for i, order in enumerate(orders[:10], 1):
+        text = f"📷 *Заказы без фото загрузки* ({len(orders)}):\n\n"
+        for i, order in enumerate(orders[:15], 1):
             text += f"{i}. *{order.order_number}*\n"
             text += f"   👤 {order.client_name}\n"
-            text += f"   📦 Контейнеров: {order.container_count}\n"
             text += f"   📍 {order.route}\n"
-            text += f"   📝 {order.status}\n\n"
+            text += f"   📦 Контейнеров: {order.container_count}\n"
+            text += f"   📅 Создан: {order.creation_date.strftime('%d.%m.%Y')}\n\n"
         
         await update.message.reply_text(
             text,
@@ -234,161 +121,233 @@ async def active_orders_command(update: Update, context: ContextTypes.DEFAULT_TY
         
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Ошибка при получении заказов: {str(e)[:100]}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔧 Проверить настройки", callback_data="dbstatus")
-            ]])
+            f"❌ Ошибка: {str(e)[:100]}"
         )
 
-# Команда /search
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск заказов"""
+# Команда /pdf
+async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сгенерировать PDF отчет по заказу"""
     if not context.args:
         await update.message.reply_text(
-            "🔍 Использование: `/search <текст>`\n\n"
-            "Пример: `/search ORD-001`\n"
-            "Пример: `/search Company`",
+            "📄 Использование: `/pdf <номер_заказа>`\n\n"
+            "Пример: `/pdf ORD-001`\n"
+            "Пример: `/pdf 2024-001`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
     
-    search_text = ' '.join(context.args)
+    order_number = ' '.join(context.args)
     try:
-        orders = db.search_orders(search_text)
+        order = db.get_order_by_number(order_number)
         
-        if not orders:
+        if not order:
             await update.message.reply_text(
-                f"🔍 По запросу '{search_text}' ничего не найдено.\n\n"
-                "Проверьте:\n"
-                "1. Правильность написания\n"
-                "2. Есть ли данные в базе\n"
-                "3. Настройки синхронизации"
+                f"❌ Заказ '{order_number}' не найден.",
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
-        text = f"🔍 *Результаты поиска* ({len(orders)}):\n\n"
-        for i, order in enumerate(orders[:5], 1):
-            text += f"{i}. *{order.order_number}* - {order.client_name}\n"
-            text += f"   📦 {order.container_count} контейнеров\n"
-            text += f"   📍 {order.route}\n"
-            text += f"   📝 {order.status}\n\n"
+        # Генерируем PDF
+        pdf_bytes = generate_order_pdf(order)
         
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN
+        # Отправляем PDF
+        await update.message.reply_document(
+            document=io.BytesIO(pdf_bytes),
+            filename=f"Отчет_{order_number}_{datetime.now().strftime('%Y%m%d')}.pdf",
+            caption=f"📄 Отчет по заказу {order_number}"
         )
         
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Ошибка поиска: {str(e)[:100]}"
+            f"❌ Ошибка генерации PDF: {str(e)[:100]}"
         )
 
-# Команда /summary
-async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сводная статистика"""
+# Команда /pdf_summary
+async def pdf_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сгенерировать сводный PDF отчет"""
     try:
-        stats = db.get_statistics(30)
+        # Получаем период из аргументов
+        days = 30
+        if context.args:
+            try:
+                days = int(context.args[0])
+                if days > 365:
+                    days = 365
+            except:
+                pass
+        
+        # Генерируем PDF
+        pdf_bytes = generate_summary_pdf(days)
+        
+        # Отправляем PDF
+        await update.message.reply_document(
+            document=io.BytesIO(pdf_bytes),
+            filename=f"Сводный_отчет_{datetime.now().strftime('%Y%m%d')}.pdf",
+            caption=f"📊 Сводный отчет за {days} дней"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка генерации PDF: {str(e)[:100]}"
+        )
+
+# Команда /subscribe
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подписаться на уведомления"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        success = notification_service.subscribe_user(chat_id)
+        
+        if success:
+            await update.message.reply_text(
+                "✅ Вы подписаны на уведомления!\n\n"
+                "Вы будете получать:\n"
+                "• Изменения статусов заказов\n"
+                "• Напоминания о событиях\n"
+                "• Оповещения о проблемах\n\n"
+                "Используйте /settings для настройки",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Не удалось подписаться. Попробуйте позже."
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка: {str(e)[:100]}"
+        )
+
+# Команда /unsubscribe
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отписаться от уведомлений"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        success = notification_service.unsubscribe_user(chat_id)
+        
+        if success:
+            await update.message.reply_text(
+                "❌ Вы отписаны от уведомлений.\n"
+                "Используйте /subscribe чтобы подписаться снова.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Не удалось отписаться."
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка: {str(e)[:100]}"
+        )
+
+# Команда /settings
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки уведомлений"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        settings = notification_service.get_user_settings(chat_id)
+        
+        if not settings:
+            await update.message.reply_text(
+                "Вы не подписаны на уведомления. Используйте /subscribe"
+            )
+            return
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Уведомления о событиях", 
+                                   callback_data="toggle_events"),
+                InlineKeyboardButton("✅" if settings['notify_events'] else "❌", 
+                                   callback_data="toggle_events_status")
+            ],
+            [
+                InlineKeyboardButton("⏰ Напоминания", 
+                                   callback_data="toggle_reminders"),
+                InlineKeyboardButton("✅" if settings['notify_reminders'] else "❌", 
+                                   callback_data="toggle_reminders_status")
+            ],
+            [
+                InlineKeyboardButton("⚠️ Оповещения", 
+                                   callback_data="toggle_alerts"),
+                InlineKeyboardButton("✅" if settings['notify_alerts'] else "❌", 
+                                   callback_data="toggle_alerts_status")
+            ],
+            [
+                InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
+            ]
+        ]
         
         text = f"""
-📊 *Сводная статистика за 30 дней:*
+⚙️ *Настройки уведомлений:*
 
-📦 Всего заказов: {stats['total_orders']}
-✅ Завершено: {stats['completed_orders']}
-🔄 Активных: {stats['active_orders']}
-📦 Контейнеров: {stats['total_containers']}
-⚖️ Вес: {stats['total_weight']:.0f} кг
-📏 Объем: {stats['total_volume']:.1f} м³
+📅 Уведомления о событиях: {'✅ Включено' if settings['notify_events'] else '❌ Выключено'}
+⏰ Напоминания за {settings['hours_before']} часов: {'✅ Включено' if settings['notify_reminders'] else '❌ Выключено'}
+⚠️ Оповещения о проблемах: {'✅ Включено' if settings['notify_alerts'] else '❌ Выключено'}
 
-*Информация о системе:*
-🤖 Бот: Работает
-🗄️ База: {'Supabase' if os.getenv('DATABASE_URL') else 'Временная'}
-🔄 Синхронизация: {'Настроена' if os.getenv('SYNC_API_KEY') else 'Требует настройки'}
-
-*Для полной функциональности:*
-1. Настройте синхронизацию с WPF программой
-2. Добавьте API ключ в переменные Railway
+Нажмите на кнопки чтобы изменить настройки.
 """
         
         await update.message.reply_text(
             text,
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Ошибка при получении статистики: {str(e)[:100]}"
+            f"❌ Ошибка: {str(e)[:100]}"
         )
 
-# Команда /contacts
-async def contacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Контакты компании"""
-    contacts_text = """
-🏢 *Margiana Logistic Services*
+# Функция для отправки уведомлений
+async def send_notifications(context: ContextTypes.DEFAULT_TYPE):
+    """Отправка уведомлений"""
+    try:
+        notifications = notification_service.get_upcoming_notifications()
+        
+        for notification in notifications:
+            chat_id = notification['chat_id']
+            message = notification['message']
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Помечаем как отправленное
+                notification_service.mark_notification_sent(notification['id'])
+                
+            except Exception as e:
+                logger.error(f"Ошибка отправки уведомления: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка получения уведомлений: {e}")
 
-📞 Телефон: +993 61 55 77 79
-📧 Email: perman@margianalogistics.com
-📱 Telegram: @margiana_logistics
+# Фоновая задача для уведомлений
+async def notification_job(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для проверки уведомлений"""
+    await send_notifications(context)
 
-🌐 *Международная логистика и транспорт:*
-• Китай → Туркменистан через Иран
-• Морские перевозки
-• Таможенное оформление
-• Сопровождение грузов
-
-*Техническая поддержка бота:*
-Для настройки синхронизации с WPF программой
-обратитесь к разработчику.
-"""
-    
-    await update.message.reply_text(
-        contacts_text,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-# Обработчик callback-запросов
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий кнопок"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    
-    if data == "active":
-        await active_orders_command(update, context)
-    elif data == "today":
-        await update.message.reply_text("Функция 'События сегодня' скоро будет доступна!")
-    elif data == "contacts":
-        await contacts_command(update, context)
-    elif data == "help":
-        await help_command(update, context)
-    elif data == "dbstatus":
-        await dbstatus_command(update, context)
-
-# Обработчик ошибок
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ошибок"""
-    logger.error(f"Update {update} caused error {context.error}")
-    
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "❌ Произошла ошибка. Используйте /dbstatus для проверки настроек."
-        )
+# Функция для запуска планировщика
+def start_scheduler(application):
+    """Запуск планировщика уведомлений"""
+    # Проверяем каждые 5 минут
+    job_queue = application.job_queue
+    job_queue.run_repeating(notification_job, interval=300, first=10)
 
 # Основная функция
 def main():
     """Запуск бота"""
     logger.info("=" * 50)
-    logger.info("🚀 Запуск Logistics Telegram Bot")
+    logger.info("🚀 Запуск Logistics Telegram Bot с уведомлениями")
     logger.info("=" * 50)
     
-    # Выводим информацию о настройках
-    logger.info(f"🤖 TELEGRAM_BOT_TOKEN: {'✅ Установлен' if TELEGRAM_BOT_TOKEN else '❌ Отсутствует'}")
-    logger.info(f"🗄️ DATABASE_URL: {'✅ Установлен' if os.getenv('DATABASE_URL') else '❌ Отсутствует'}")
-    logger.info(f"👑 ADMIN_CHAT_IDS: {os.getenv('ADMIN_CHAT_IDS', 'Не установлены')}")
-    
-    if not os.getenv('DATABASE_URL'):
-        logger.warning("⚠️  DATABASE_URL не установлен. Используется временная база данных.")
-        logger.info("Для работы с реальными данными создайте базу на supabase.com")
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
+        sys.exit(1)
     
     # Создание приложения
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -401,6 +360,12 @@ def main():
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("summary", summary_command))
     application.add_handler(CommandHandler("contacts", contacts_command))
+    application.add_handler(CommandHandler("orders_no_photos", orders_no_photos_command))
+    application.add_handler(CommandHandler("pdf", pdf_command))
+    application.add_handler(CommandHandler("pdf_summary", pdf_summary_command))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     
     # Регистрация обработчика callback-запросов
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -408,9 +373,11 @@ def main():
     # Регистрация обработчика ошибок
     application.add_error_handler(error_handler)
     
-    # Запуск бота
+    # Запуск планировщика уведомлений
+    start_scheduler(application)
+    
     logger.info("✅ Бот запущен и готов к работе!")
-    logger.info("ℹ️  Используйте /dbstatus для проверки настроек")
+    logger.info("ℹ️  Уведомления включены, проверка каждые 5 минут")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
